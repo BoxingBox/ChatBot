@@ -1,0 +1,198 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+# This workflow will build a Java project with Gradle and cache/restore any dependencies to improve the workflow execution time
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-gradle
+name: Java CI with Gradle
+on:
+  push:
+    branches: ["test-2"]
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, X64, dpp-automation]
+    outputs:
+      ecroutput: ${{ steps.getecrtoken.outputs.ecrtoken }}
+      idoutput: ${{ steps.idgeneration.outputs.workflowid }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Extract branch name
+        shell: bash
+        run: echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
+        id: extract_branch
+
+
+      - name: Docker info
+        run: |
+          docker images
+
+      - name: Generating new Run ID
+        id: idgeneration
+        run: |
+          id=$(date '+%s%N' | sha256sum | base64 | tr -dc 'a-z' | head -c 5)
+          
+          echo workflowid=${id} >> "$GITHUB_OUTPUT"
+          echo workflowid=${id} >> "$GITHUB_ENV"
+          echo ${id}
+          echo id
+        #       # random_number=$((RANDOM % 100))
+        #       # echo ${random_number}
+        #       # id=secret${{ github.run_id }}${random_number}
+
+
+
+      - name: GitHub Action for GraalVM
+        # You may pin to the exact commit or the version.
+        # uses: graalvm/setup-graalvm@406690122eccb9e6c3447272d1bf22bb07a4550e
+        uses: graalvm/setup-graalvm@v1
+        with:
+          # GraalVM version (release, latest, dev).
+          version: 22.3.1
+          # Java version (11 or 17, 8 or 16 for older releases).
+          java-version: 17
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - uses: gradle/gradle-build-action@v2
+        with:
+          gradle-version: release-candidate
+
+      - name: Build
+        run: |
+          gradle clean build -x test
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip   
+          sudo ./aws/install --update
+          rm awscliv2.zip
+
+      - name: Configure EKS secret in k8s-manifest.yaml and match it to workflow id
+        run: |
+          echo ${{ steps.idgeneration.outputs.workflowid }}
+          sed -i "s/- name: kubesecret/- name: ${{ steps.idgeneration.outputs.workflowid }}/g" k8s-deployment.yaml
+          cat k8s-deployment.yaml
+
+
+      - name: Install eksctl and kubectl
+        run: |
+          sudo curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | sudo tar xz -C /usr/local/bin
+          sudo curl --silent --location "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          sudo chmod +x /usr/local/bin/kubectl
+
+
+      - name: Configure AWS credentials
+        id: aws_credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          role-to-assume: arn:aws:iam::595359642314:role/pfe-ga-customer-admin-role
+          aws-region: us-east-1
+
+      - name: Build and Push Docker Image
+        run: |
+          ls -R build/
+          docker build -t mssql-service -f src/main/docker/Dockerfile.jvm .
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 595359642314.dkr.ecr.us-east-1.amazonaws.com
+          docker tag mssql-service:latest 595359642314.dkr.ecr.us-east-1.amazonaws.com/auto-app-ecr:mssql-service
+          docker push 595359642314.dkr.ecr.us-east-1.amazonaws.com/auto-app-ecr:mssql-service
+
+      - name: Delete Local Docker Image
+        run: |
+          docker rmi -f mssql-service
+
+
+      - name: Get ECR Token
+        id: getecrtoken
+        run: |
+          echo "ecrtoken=$(aws ecr get-login-password --region us-east-1)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    runs-on: [self-hosted, linux, X64, dpp-automation]
+    needs: build
+    steps:
+      - env:
+          ECROUTPUT: ${{needs.build.outputs.ecroutput }}
+          IDOUTPUT: ${{needs.build.outputs.idoutput }}
+
+        run: |
+          echo "$ECROUTPUT"  
+          echo "$IDOUTPUT"
+      - uses: actions/checkout@v3
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        id: install-kubectl
+
+      - name: Configure kubectl
+        run: |
+          aws sts get-caller-identity --query 'Account' --output text
+          mkdir -p $HOME/.kube
+          cp $GITHUB_WORKSPACE/src/main/resources/META-INF/resources/kube_config/config $HOME/.kube
+          kubectl version --client     
+
+
+      - name: Get caller ID
+        run: aws sts get-caller-identity
+
+      - name: Configure AWS credentials
+        id: aws_credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          role-to-assume: arn:aws:iam::330470878083:role/pfe-ga-eps-automa-dev-apps-cas
+          aws-region: us-east-1
+
+      - name: Test ecr-token
+        run: echo "The ECR token is $ECROUTPUT"
+        env:
+          ECROUTPUT: ${{needs.build.outputs.ecroutput }}
+
+      - name: Get pods
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get componentstatuses
+          kubectl get pods --all-namespaces
+          kubectl get deployments --all-namespaces
+          kubectl get pods  
+          
+          # ${{ needs.build.outputs.idoutput }}
+
+      - name: Configure EKS secret in k8s-manifest.yaml and match it to workflow id
+        run: |
+          echo $IDOUTPUT
+          sed -i "s/- name: kubesecret/- name: $IDOUTPUT/g" k8s-deployment.yaml
+          cat k8s-deployment.yaml
+        env:
+          ECROUTPUT: ${{needs.build.outputs.ecroutput }}
+          IDOUTPUT: ${{needs.build.outputs.idoutput }}
+
+      - name: Create k8s secret and deploy
+        run:  |
+          echo "KubeSecret is ${{ needs.build.outputs.idoutput }}" 
+          echo "$IDOUTPUT"
+          cat k8s-deployment.yaml
+          if [ -n "${{ needs.build.outputs.ecroutput }}" ]; then
+            echo "ECR output is available. Creating secret and deploying to EKS."            
+            kubectl create secret docker-registry $IDOUTPUT --docker-username=AWS --docker-password="${{ needs.build.outputs.ecroutput }}" --docker-server=https://595359642314.dkr.ecr.us-east-1.amazonaws.com
+            exit_code=$?
+            if [ $exit_code -eq 0 ]; then
+              echo "Secret creation successful. Deploying to EKS."
+              kubectl apply -f k8s-deployment.yaml
+            else
+              echo "Failed to create secret. Trying to deploy without secret.."
+              kubectl apply -f k8s-deployment.yaml
+            fi
+          else
+           echo "ECR output not available. Skipping secret creation and deployment."
+          fi
+        env:
+          ECROUTPUT: ${{needs.build.outputs.ecroutput }}
+          IDOUTPUT: ${{needs.build.outputs.idoutput }}
+
